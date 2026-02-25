@@ -2,97 +2,85 @@
 -- Tracks historical changes in dimension tables
 
 -- SCD for Customers (track address/segment changes)
-CREATE TABLE IF NOT EXISTS gold.dim_customer_scd (
-    customer_key SERIAL PRIMARY KEY,
-    customer_id VARCHAR(30) NOT NULL,
-    first_name VARCHAR(100),
-    last_name VARCHAR(100),
-    email VARCHAR(255),
-    phone VARCHAR(20),
-    address VARCHAR(500),
-    city VARCHAR(100),
-    state VARCHAR(50),
-    zip_code VARCHAR(20),
-    country VARCHAR(100),
-    customer_segment VARCHAR(50),
-    effective_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    effective_to TIMESTAMP DEFAULT '9999-12-31',
-    is_current BOOLEAN DEFAULT TRUE
+
+DESC TABLE SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER ;
+DESC TABLE SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER_ADDRESS ;
+
+USE WAREHOUSE COMPUTE_WH ;
+USE DATABASE SNOWFLAKE_LEARNING_DB ;
+
+CREATE OR REPLACE TABLE SILVER.CUSTOMER_DIM(
+    CUSTOMER_SK NUMBER AUTOINCREMENT ,
+    CUSTOMER_ID NUMBER ,
+    STATE STRING,
+    START_DATE DATE,
+    END_DATE DATE,
+    IS_CURRENT STRING 
 );
 
--- Function to handle SCD Type 2 for customers
-CREATE OR REPLACE FUNCTION scd.update_customer_scd()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Check if any tracked columns changed
-    IF OLD.address <> NEW.address 
-       OR OLD.city <> NEW.city 
-       OR OLD.state <> NEW.state
-       OR OLD.customer_segment <> NEW.customer_segment THEN
-        -- Mark current record as expired
-        UPDATE gold.dim_customer_scd 
-        SET effective_to = CURRENT_TIMESTAMP, is_current = FALSE 
-        WHERE customer_id = OLD.customer_id AND is_current = TRUE;
-        
-        -- Insert new record
-        INSERT INTO gold.dim_customer_scd (
-            customer_id, first_name, last_name, email, phone,
-            address, city, state, zip_code, country, customer_segment
-        ) VALUES (
-            NEW.customer_id, NEW.first_name, NEW.last_name, NEW.email, NEW.phone,
-            NEW.address, NEW.city, NEW.state, NEW.zip_code, NEW.country, NEW.customer_segment
-        );
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+--INTIAL LOAD
 
--- Create trigger
-CREATE TRIGGER trg_customer_scd
-AFTER UPDATE ON clean.customers
-FOR EACH ROW
-EXECUTE FUNCTION scd.update_customer_scd();
+-- INSERT INTO SILVER.CUSTOMER_DIM (
+--     CUSTOMER_ID , 
+--     STATE ,
+--     START_DATE ,
+--     END_DATE ,
+--     IS_CURENT
+-- )
+-- SELECT 
+--     C.C_CUSTOMER_SK
+--     CA.CA_STATE,
+--     CURRENT_DATE,
+--     NULL ,
+--     'Y'
+--     FROM SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER C
+--     JOIN SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER_ADDRESS CA
+--        ON C.C_CURRENT_ADDR_SK = CA.CA_ADDRESS_SK ;
 
--- SCD for Products (track price/category changes)
-CREATE TABLE IF NOT EXISTS gold.dim_product_scd (
-    product_key SERIAL PRIMARY KEY,
-    product_id VARCHAR(30) NOT NULL,
-    product_name VARCHAR(255),
-    category VARCHAR(100),
-    sub_category VARCHAR(100),
-    brand VARCHAR(100),
-    cost_price DECIMAL(10,2),
-    list_price DECIMAL(10,2),
-    effective_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    effective_to TIMESTAMP DEFAULT '9999-12-31',
-    is_current BOOLEAN DEFAULT TRUE
-);
+--INITIAL LOAD
+INSERT INTO SILVER.CUSTOMER_DIM (CUSTOMER_ID, STATE, START_DATE, END_DATE, IS_CURRENT)
+SELECT
+    c_customer_sk AS CUSTOMER_ID,
+    ca.ca_state AS STATE,
+    CURRENT_DATE AS START_DATE,
+    NULL AS END_DATE,
+    'Y' AS IS_CURRENT   
+FROM SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER c
+JOIN SNOWFLAKE_SAMPLE_DATA.TPCDS_SF100TCL.CUSTOMER_ADDRESS ca
+ON c.c_current_addr_sk = ca.ca_address_sk;
 
--- Function to handle SCD Type 2 for products
-CREATE OR REPLACE FUNCTION scd.update_product_scd()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF OLD.category <> NEW.category 
-       OR OLD.sub_category <> NEW.sub_category
-       OR OLD.list_price <> NEW.list_price
-       OR OLD.cost_price <> NEW.cost_price THEN
-        UPDATE gold.dim_product_scd 
-        SET effective_to = CURRENT_TIMESTAMP, is_current = FALSE 
-        WHERE product_id = OLD.product_id AND is_current = TRUE;
-        
-        INSERT INTO gold.dim_product_scd (
-            product_id, product_name, category, sub_category, 
-            brand, cost_price, list_price
-        ) VALUES (
-            NEW.product_id, NEW.product_name, NEW.category, NEW.sub_category,
-            NEW.brand, NEW.cost_price, NEW.list_price
-        );
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+SELECT COUNT(*) FROM SILVER.CUSTOMER_DIM ;
 
-CREATE TRIGGER trg_product_scd
-AFTER UPDATE ON clean.products
-FOR EACH ROW
-EXECUTE FUNCTION scd.update_product_scd();
+SELECT *  FROM SILVER.CUSTOMER_DIM LIMIT 5 ;
+
+-- CREATE A SMALL STAGE
+CREATE OR REPLACE TABLE SILVER.CUSTOMER_STAGE AS
+SELECT
+     CUSTOMER_ID,STATE    
+    FROM SILVER.CUSTOMER_DIM
+    WHERE is_current = 'Y';
+
+    --manually update one row
+UPDATE SILVER.CUSTOMER_DIM
+set STATE = 'IN'
+WHERE CUSTOMER_ID = 81970775;
+
+SELECT * FROM SILVER.CUSTOMER_STAGE WHERE CUSTOMER_ID = 81970775;
+
+MERGE INTO SILVER.CUSTOMER_DIM target
+USING SILVER.CUSTOMER_STAGE source 
+On target.customer_id=source.customer_id
+AND target.is_current='Y'
+WHEN MATCHED AND target.state <> source.state THEN
+UPDATE 
+SET target.end_date = CURRENT_DATE, 
+target.is_current = 'N'
+WHEN NOT MATCHED THEN
+INSERT (customer_id, state, start_date, end_date, is_current)
+VALUES (source.customer_id, source.state, CURRENT_DATE, NULL, 'Y');
+
+
+SELECT * FROM SILVER.CUSTOMER_DIM
+WHERE CUSTOMER_ID = 81970775
+ORDER BY START_DATE DESC;
+
