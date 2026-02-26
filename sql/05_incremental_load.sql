@@ -2,97 +2,80 @@
 -- Loads only new/changed data since last load
 
 -- Create watermark table to track last load times
-CREATE TABLE IF NOT EXISTS etl.watermarks (
-    table_name VARCHAR(100) PRIMARY KEY,
-    last_load_timestamp TIMESTAMP,
-    last_load_id VARCHAR(50),
-    status VARCHAR(20) DEFAULT 'SUCCESS',
-    records_loaded INTEGER DEFAULT 0
+
+USE WAREHOUSE COMPUTE_WH;
+USE DATABASE SNOWFLAKE_LEARNING_DB;
+
+-- -----------------------------------------------------
+-- STEP 1: Simulate Incoming Customer Changes
+-- -----------------------------------------------------
+
+CREATE OR REPLACE TABLE SILVER.CUSTOMER_STAGE AS
+SELECT customer_id, state
+FROM SILVER.CUSTOMER_DIM
+WHERE is_current = 'Y';
+
+-- Simulate change for one customer
+UPDATE SILVER.CUSTOMER_STAGE
+SET state = 'TX'
+WHERE customer_id = (
+    SELECT customer_id FROM SILVER.CUSTOMER_STAGE LIMIT 1
 );
 
--- Incremental sales load (by timestamp)
-CREATE OR REPLACE PROCEDURE etl.load_sales_incremental()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_last_load TIMESTAMP;
-    v_count INTEGER;
-BEGIN
-    -- Get last load timestamp
-    SELECT COALESCE(last_load_timestamp, '1900-01-01') 
-    INTO v_last_load 
-    FROM etl.watermarks 
-    WHERE table_name = 'pos_sales';
-    
-    -- Insert new records
-    INSERT INTO clean.sales (
-        sale_id, sale_date, store_id, product_id, quantity,
-        unit_price, discount, total_amount, payment_method, customer_id, loaded_at
-    )
-    SELECT 
-        sale_id, sale_date, store_id, product_id, quantity,
-        unit_price, discount, total_amount, payment_method, customer_id, loaded_at
-    FROM raw.pos_sales
-    WHERE loaded_at > v_last_load
-    ON CONFLICT (sale_id) DO NOTHING;
-    
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-    
-    -- Update watermark
-    INSERT INTO etl.watermarks (table_name, last_load_timestamp, records_loaded)
-    VALUES ('pos_sales', CURRENT_TIMESTAMP, v_count)
-    ON CONFLICT (table_name) DO UPDATE 
-    SET last_load_timestamp = CURRENT_TIMESTAMP, records_loaded = v_count;
-    
-    COMMIT;
-END;
-$$;
+-- -----------------------------------------------------
+-- STEP 2: Apply SCD Type 2 Logic
+-- -----------------------------------------------------
 
--- Incremental customer load
-CREATE OR REPLACE PROCEDURE etl.load_customers_incremental()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_last_load TIMESTAMP;
-    v_count INTEGER;
-BEGIN
-    SELECT COALESCE(last_load_timestamp, '1900-01-01') 
-    INTO v_last_load 
-    FROM etl.watermarks 
-    WHERE table_name = 'crm_customers';
-    
-    INSERT INTO clean.customers (
-        customer_id, first_name, last_name, email, phone,
-        address, city, state, zip_code, country, customer_segment, created_at, loaded_at
-    )
-    SELECT 
-        customer_id, first_name, last_name, email, phone,
-        address, city, state, zip_code, country, customer_segment, created_at, loaded_at
-    FROM raw.crm_customers
-    WHERE loaded_at > v_last_load
-    ON CONFLICT (customer_id) DO UPDATE SET
-        first_name = EXCLUDED.first_name,
-        last_name = EXCLUDED.last_name,
-        email = EXCLUDED.email;
-    
-    GET DIAGNOSTICS v_count = ROW_COUNT;
-    
-    INSERT INTO etl.watermarks (table_name, last_load_timestamp, records_loaded)
-    VALUES ('crm_customers', CURRENT_TIMESTAMP, v_count)
-    ON CONFLICT (table_name) DO UPDATE 
-    SET last_load_timestamp = CURRENT_TIMESTAMP, records_loaded = v_count;
-    
-    COMMIT;
-END;
-$$;
+MERGE INTO SILVER.CUSTOMER_DIM target
+USING SILVER.CUSTOMER_STAGE source
+ON target.customer_id = source.customer_id
+AND target.is_current = 'Y'
 
--- Master procedure to run all incremental loads
-CREATE OR REPLACE PROCEDURE etl.run_incremental_load()
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    CALL etl.load_sales_incremental();
-    CALL etl.load_customers_incremental();
-    -- Add more incremental loads here
-END;
-$$;
+WHEN MATCHED AND target.state <> source.state THEN
+UPDATE SET
+    target.end_date = CURRENT_DATE,
+    target.is_current = 'N'
+
+WHEN NOT MATCHED THEN
+INSERT (customer_id, state, start_date, end_date, is_current)
+VALUES (source.customer_id, source.state, CURRENT_DATE, NULL, 'Y');
+
+-- -----------------------------------------------------
+-- STEP 3: Simulate Incremental Fact Load
+-- -----------------------------------------------------
+
+CREATE OR REPLACE TABLE SILVER.FACT_STAGE (
+    customer_id NUMBER,
+    store_id NUMBER,
+    sales_price NUMBER,
+    transaction_date DATE
+);
+
+INSERT INTO SILVER.FACT_STAGE VALUES
+(101, 10, 500, '2024-01-10'),
+(101, 10, 700, '2021-01-10');
+
+-- -----------------------------------------------------
+-- STEP 4: Load Fact with Historical Join
+-- -----------------------------------------------------
+
+CREATE OR REPLACE TABLE SILVER.FACT_SALES AS
+SELECT
+    d.customer_sk,
+    f.store_id,
+    f.sales_price,
+    f.transaction_date
+FROM SILVER.FACT_STAGE f
+JOIN SILVER.CUSTOMER_DIM d
+    ON f.customer_id = d.customer_id
+    AND f.transaction_date >= d.start_date
+    AND (f.transaction_date < d.end_date OR d.end_date IS NULL);
+
+-- -----------------------------------------------------
+-- STEP 5: Validation
+-- -----------------------------------------------------
+
+SELECT COUNT(*) FROM SILVER.CUSTOMER_DIM
+ORDER BY customer_id, start_date;
+
+SELECT * FROM SILVER.FACT_SALES;
